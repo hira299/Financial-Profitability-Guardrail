@@ -1,0 +1,288 @@
+{
+  "name": "Financial Profitability Guardrail",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "getAll",
+        "team": "90182476025",
+        "space": "90189948251",
+        "folderless": true,
+        "list": "901816198724",
+        "filters": {
+          "archived": false
+        }
+      },
+      "type": "n8n-nodes-base.clickUp",
+      "typeVersion": 1,
+      "position": [
+        -192,
+        -256
+      ],
+      "id": "d4d5e02c-fb34-4e09-b29c-d84e0922532c",
+      "name": "[GET] Fetch_Active_Tasks",
+      "credentials": {
+        "clickUpApi": {
+          "id": "xvVIXuP0s5BiD6cU",
+          "name": "INVALID_KEY"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = [];\n\n// Loop through the raw ClickUp payload\nfor (const item of $input.all()) {\n  const task = item.json;\n  \n  // 1. Extract Budget (ClickUp hides this inside a custom_fields array)\n  let budget = 0;\n  if (task.custom_fields) {\n    const budgetField = task.custom_fields.find(f => f.name === \"Budget Hours\");\n    if (budgetField && budgetField.value) {\n      budget = parseFloat(budgetField.value);\n    }\n  }\n  \n  // 2. Extract Time Tracked (ClickUp returns this in milliseconds. We need hours.)\n  const timeTrackedMs = parseInt(task.time_spent) || 0;\n  const timeTrackedHours = timeTrackedMs / 3600000;\n  \n  // 3. Rebuild a clean JSON object\n  results.push({\n    json: {\n      task_id: task.id,\n      task_name: task.name,\n      budget_hours: budget,\n      tracked_hours: parseFloat(timeTrackedHours.toFixed(2))\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        32,
+        -352
+      ],
+      "id": "7f762b74-5437-457f-82c7-829f8c2fa207",
+      "name": "[TRANSFORM] Normalize_Payload"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT task_id, current_state FROM project_health_state;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        256,
+        -352
+      ],
+      "id": "f77ef636-4381-4ec6-bec5-a9b5447856c4",
+      "name": "[GET] DB_Previous_States",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "mkNXuIjunaXgWAE1",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1. Grab data from the previous nodes\n// We use n8n's $items() method to fetch the ClickUp payload, ignoring the DB overwrite\nconst clickupTasks = $items(\"[TRANSFORM] Normalize_Payload\").map(item => item.json);\nconst dbStates = $input.all().map(item => item.json);\n\nconst results = [];\n\nfor (const task of clickupTasks) {\n    // 2. Find the previous state in the DB (Defaults to \"NEW\" if not found)\n    const dbRecord = dbStates.find(r => r.task_id === task.task_id);\n    const previousState = dbRecord ? dbRecord.current_state : \"NEW\";\n    \n    // 3. Calculate the Burn Rate\n    let percent = 0;\n    if (task.budget_hours > 0) {\n        percent = (task.tracked_hours / task.budget_hours) * 100;\n    }\n    \n    // 4. The State Machine Logic\n    let newState = \"HEALTHY\";\n    if (percent >= 100) newState = \"CRITICAL\";\n    else if (percent >= 80) newState = \"WARNING\";\n    \n    // 5. The Delta Gate (Should we alert the CEO/Manager?)\n    // We ONLY alert if the state has CHANGED and it is NOT healthy.\n    let requiresAlert = false;\n    if (newState !== previousState && newState !== \"HEALTHY\") {\n        requiresAlert = true; \n    }\n\n    // 6. Output the final decision payload\n    results.push({\n        json: {\n            task_id: task.task_id,\n            task_name: task.task_name,\n            budget_hours: task.budget_hours,\n            tracked_hours: task.tracked_hours,\n            burn_percent: parseFloat(percent.toFixed(1)),\n            previous_state: previousState,\n            new_state: newState,\n            requires_alert: requiresAlert\n        }\n    });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        -352
+      ],
+      "id": "6d2c0a57-556e-41de-b838-121fee2ed6cf",
+      "name": "[CALCULATE] Delta_Engine"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO project_health_state (task_id, task_name, total_budget_hours, hours_logged, current_state) \nVALUES ($1, $2, $3, $4, $5) \nON CONFLICT (task_id) \nDO UPDATE SET \n    hours_logged = EXCLUDED.hours_logged, \n    current_state = EXCLUDED.current_state, \n    last_checked_at = CURRENT_TIMESTAMP;",
+        "options": {
+          "queryReplacement": "={{ $json.task_id }}, {{ $json.task_name }}, {{ $json.budget_hours }}, {{ $json.tracked_hours }}, {{ $json.new_state}}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        704,
+        -480
+      ],
+      "id": "600517ba-b9f6-4b2a-9041-f35226a2ee7e",
+      "name": "[UPSERT] PG_Save_State",
+      "credentials": {
+        "postgres": {
+          "id": "mkNXuIjunaXgWAE1",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f6d0be4a-cd0c-41d6-a5b0-da88eb3aa512",
+              "leftValue": "={{ $json.requires_alert }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        704,
+        -256
+      ],
+      "id": "99ec50bf-8e9b-481f-9900-1b2560bc89be",
+      "name": "[GATE] Check_Alert_Flag"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://webhook.site/d04cf114-6710-4796-8405-f318ea11b3cb",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": \"🚨 PROFITABILITY ALERT: Task '{{ $json.task_name }}' has shifted to {{ $json.new_state }}. Burn Rate: {{ $json.burn_percent }}%. Tracked: {{ $json.tracked_hours }} / {{ $json.budget_hours }} hours. Immediate review required.\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        976,
+        -272
+      ],
+      "id": "9df17e3b-5f7d-4932-a58a-e1a7264a9cab",
+      "name": "[POST] Alert_Manager"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dlq_clickup_failures (error_message, payload) \nVALUES ($1, $2);",
+        "options": {
+          "queryReplacement": "={{ $json.error?.message || 'Manual Test/Unknown' }}, {{ JSON.stringify($json).replace(/,/g, ' | ') }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        32,
+        -160
+      ],
+      "id": "c64e1360-5c14-4d4a-bdc8-0624354b4d15",
+      "name": "[INSERT] Log_API_Failure",
+      "credentials": {
+        "postgres": {
+          "id": "mkNXuIjunaXgWAE1",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -416,
+        -256
+      ],
+      "id": "d24e4a96-b9b8-4188-8c3f-8ec4bf40e8c0",
+      "name": "Trigger"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "[GET] Fetch_Active_Tasks": {
+      "main": [
+        [
+          {
+            "node": "[TRANSFORM] Normalize_Payload",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "[INSERT] Log_API_Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "[TRANSFORM] Normalize_Payload": {
+      "main": [
+        [
+          {
+            "node": "[GET] DB_Previous_States",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "[GET] DB_Previous_States": {
+      "main": [
+        [
+          {
+            "node": "[CALCULATE] Delta_Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "[CALCULATE] Delta_Engine": {
+      "main": [
+        [
+          {
+            "node": "[UPSERT] PG_Save_State",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "[GATE] Check_Alert_Flag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "[UPSERT] PG_Save_State": {
+      "main": [
+        []
+      ]
+    },
+    "[GATE] Check_Alert_Flag": {
+      "main": [
+        [
+          {
+            "node": "[POST] Alert_Manager",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger": {
+      "main": [
+        [
+          {
+            "node": "[GET] Fetch_Active_Tasks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "4baa4fe3-5014-4866-a558-e1bca58a9736",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "558b6b34757c4e9b3d5b402e3e41916faef98d895117813883c4a55f0c14c35a"
+  },
+  "id": "Q0CZBrGCIBvJjl0v",
+  "tags": []
+}
